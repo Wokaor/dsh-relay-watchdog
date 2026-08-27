@@ -51,7 +51,26 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 
 ## 安装
 
-本插件是 [DSH](https://github.com/deepseek-ai/DeepSeek-Harness) 的 Cordis bundle，运行期由 DSH 宿主提供依赖（`@deepseek-ai/*`、`schemastery` 等）。
+### 一键安装（推荐）
+
+把本仓库地址直接交给 DSH 的 `plugin` 子命令，DSH 会自动下载、装配进你的 profile，无需手动改任何配置：
+
+```bash
+dsh plugin --profile web add github:Wokaor/dsh-relay-watchdog
+```
+
+- `--profile web` 是「网页版」的 profile，也可换成你自己的 profile 名（如 `tui`）。
+- 也支持完整链接写法：
+
+```bash
+dsh plugin --profile web add https://github.com/Wokaor/dsh-relay-watchdog
+```
+
+- 本仓库已提交**预编译的 `lib/`**，安装过程不运行任何构建脚本，开箱即用。
+
+**工作原理**：`dsh plugin <参数>` 会把 `add` 后面的参数原样转给 `pnpm` 在 profile 目录里执行；本包的 `package.json` 声明了 `dsh.bundle.patch`，所以 `pnpm` 装完后 DSH 会自动把它识别为一个 bundle 加入 profile 的装配列表，重启 DSH 即生效。
+
+### 从源码构建（插件开发者）
 
 直接把此网站链接发给dsh，自动化安装即可。
 
@@ -60,7 +79,9 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 bash scripts/build.sh
 ```
 
-挂载方式：把本包加入 DSH profile 的 bundle 列表（`cordis.patch.yml` 的 `insert` 已给出条目模板）：
+### 手动挂载（参考）
+
+如果不用 `dsh plugin`，也可把 `cordis.patch.yml` 里的条目合并进 profile 配置树：
 
 ```yaml
 - insert:
