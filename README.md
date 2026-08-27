@@ -53,6 +53,8 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 
 本插件是 [DSH](https://github.com/deepseek-ai/DeepSeek-Harness) 的 Cordis bundle，运行期由 DSH 宿主提供依赖（`@deepseek-ai/*`、`schemastery` 等）。
 
+直接把此网站链接发给dsh，自动化安装即可。
+
 ```bash
 # 有 DSH 源码 checkout 时，用它的 tsc 从 src 编译到 lib；否则校验预编译的 lib/。
 bash scripts/build.sh
