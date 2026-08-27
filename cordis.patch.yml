@@ -1,0 +1,5 @@
+# dsh-relay-watchdog — DSH bundle patch
+# 以 Cordis 插件的方式挂载到 profile 配置树（id 用于 fiber 覆盖/dedup，name 为包名）。
+- insert:
+    - id: dsh-relay-watchdog
+      name: 'dsh-relay-watchdog'

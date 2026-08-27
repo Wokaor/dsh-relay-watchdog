@@ -1,0 +1,12 @@
+# 依赖（DSH 运行期提供；本地 junction 不要入库）
+node_modules/
+
+# 打包产物
+*.tgz
+
+# 生成的类型声明
+lib/types/
+
+# 系统/编辑器杂项
+.DS_Store
+*.log
