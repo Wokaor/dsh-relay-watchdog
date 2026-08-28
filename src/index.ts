@@ -27,6 +27,12 @@ const DEFAULT_RESTART_INSTRUCTION = [
   '不要重复已完成的工作，也不要假装还在运行。',
 ].join('\n')
 
+const DEFAULT_CUTOFF_INSTRUCTION = [
+  '【系统提示】上一次模型请求的输出因达到 token 上限被截断，任务尚未完成。',
+  '请先根据上文梳理已经完成的进度，然后从截断处继续完成剩余工作；',
+  '不要重复已完成的部分，也不要把未完成的任务当作已经完成。',
+].join('\n')
+
 const DEFAULTS = {
   enabled: true,
   manualOverride: false,
@@ -34,9 +40,10 @@ const DEFAULTS = {
   watchAll: true,
   sessionIdPattern: '',
   retryableCodes: ['TRANSPORT', 'SERVER', 'TIMEOUT', 'RATE_LIMIT', 'HTTP_502', 'HTTP_503', 'HTTP_504', 'UNKNOWN'],
-  retryableStatuses: [502, 503, 504],
-  retryableMessagePatterns: [] as string[],
+  retryableStatuses: [500, 502, 503, 504],
+  retryableMessagePatterns: ['upstream', 'temporarily unavailable', 'rate limit exceeded'],
   maxRetries: 8,
+  stopAfterExhaustion: true,
   fastRetryCount: 3,
   fastRetryDelayMs: 800,
   steadyRetryDelayMs: 30000,
@@ -47,9 +54,12 @@ const DEFAULTS = {
   instruction: DEFAULT_INSTRUCTION,
   instructionCooldownMs: 60000,
   restartOnTurnError: true,
+  reviveOnMaxTokens: true,
   restartInstruction: DEFAULT_RESTART_INSTRUCTION,
+  cutoffInstruction: DEFAULT_CUTOFF_INSTRUCTION,
   restartCooldownMs: 15000,
   maxAutoRestartsPerSession: 5,
+  resetBudgetOnSuccess: true,
   enableApi: true,
   maxIncidents: 200,
 }
@@ -61,9 +71,10 @@ export const Config = z.object({
   watchAll: z.boolean().default(true),
   sessionIdPattern: z.string().default(''),
   retryableCodes: z.array(z.string()).default(['TRANSPORT', 'SERVER', 'TIMEOUT', 'RATE_LIMIT', 'HTTP_502', 'HTTP_503', 'HTTP_504', 'UNKNOWN']),
-  retryableStatuses: z.array(z.number()).default([502, 503, 504]),
-  retryableMessagePatterns: z.array(z.string()).default([]),
+  retryableStatuses: z.array(z.number()).default([500, 502, 503, 504]),
+  retryableMessagePatterns: z.array(z.string()).default(['upstream', 'temporarily unavailable', 'rate limit exceeded']),
   maxRetries: z.number().step(1).min(0).default(8),
+  stopAfterExhaustion: z.boolean().default(true),
   fastRetryCount: z.number().step(1).min(0).max(30).default(3),
   fastRetryDelayMs: z.number().min(0).default(800),
   steadyRetryDelayMs: z.number().min(0).default(30000),
@@ -74,9 +85,12 @@ export const Config = z.object({
   instruction: z.string().default(DEFAULT_INSTRUCTION),
   instructionCooldownMs: z.number().min(0).default(60000),
   restartOnTurnError: z.boolean().default(true),
+  reviveOnMaxTokens: z.boolean().default(true),
   restartInstruction: z.string().default(DEFAULT_RESTART_INSTRUCTION),
+  cutoffInstruction: z.string().default(DEFAULT_CUTOFF_INSTRUCTION),
   restartCooldownMs: z.number().min(0).default(15000),
   maxAutoRestartsPerSession: z.number().step(1).min(0).default(5),
+  resetBudgetOnSuccess: z.boolean().default(true),
   enableApi: z.boolean().default(true),
   maxIncidents: z.number().step(1).min(1).default(200),
 })
@@ -133,6 +147,24 @@ export function apply(ctx: any, config: any): void {
     const max = Number(cfg().maxIncidents) || 200
     while (incidents.length > max) incidents.shift()
     return rec
+  }
+
+  // attempts 只增不减时的双保险：按插入序淘汰最旧条目，防长期会话内存无限增长
+  const MAX_ATTEMPTS = 1000
+  const pruneAttempts = () => {
+    while (attempts.size > MAX_ATTEMPTS) {
+      const oldest = attempts.keys().next().value
+      if (oldest === undefined) break
+      attempts.delete(oldest)
+    }
+  }
+
+  // 清理某个会话的所有 (session,turn,step) 计数；回合结束即为该步的终点
+  const clearAttemptsFor = (sessionId: string) => {
+    const prefix = `${sessionId}\u0000`
+    for (const key of attempts.keys()) {
+      if (key.startsWith(prefix)) attempts.delete(key)
+    }
   }
 
   const makeMessage = (text: string, summary: string) => createUserMessage({
@@ -219,6 +251,20 @@ export function apply(ctx: any, config: any): void {
       const prior = attempts.get(stepKey) ?? 0
       if (prior >= c.maxRetries) {
         attempts.delete(stepKey)
+        pushIncident({
+          id: randomUUID(), time: Date.now(), kind: 'giveup',
+          sessionId: String(agent.id), turn, step, provider: provider ?? '',
+          code: failure.code ?? '', status: failure.status ?? '', message: failure.message ?? '',
+          attempt: prior + 1,
+          note: c.stopAfterExhaustion
+            ? '单步重试耗尽：终止本回合，交由回合级复活接管'
+            : '单步重试耗尽：已放行给下游重试处理器',
+        })
+        log.warn?.(`[${agent.id}] ${provider} step ${turn}/${step} 重试耗尽（${prior + 1} 次），` +
+          (c.stopAfterExhaustion ? '终止本回合（阻断下游重试），等待回合级复活' : '放行给下游重试处理器'))
+        // stopAfterExhaustion=true（默认）：不调用 next()，waterfall 语义下直接以返回值截断整条链，
+        // 下游 dsh-llm-retry 不会再接管同一失败 → 回合以 error 终态结束 → 由第二层（turn/end）冷却后复活。
+        if (c.stopAfterExhaustion) return undefined
         return next()
       }
 
@@ -247,6 +293,7 @@ export function apply(ctx: any, config: any): void {
       }
 
       attempts.set(stepKey, attemptNo)
+      pruneAttempts()
       pushIncident({
         id: randomUUID(), time: Date.now(), kind: 'retry',
         sessionId: String(agent.id), turn, step, provider: provider ?? '',
@@ -260,7 +307,7 @@ export function apply(ctx: any, config: any): void {
     }
   }, { prepend: true })
 
-  function scheduleRestart(agent: any, failure: any, count: number) {
+  function scheduleRestart(agent: any, failure: any, count: number, instructionOverride?: string, isCutoff?: boolean) {
     const delay = Math.max(0, Number(cfg().restartCooldownMs) || 0)
     const timer = setTimeout(() => {
       timers.delete(timer)
@@ -270,12 +317,14 @@ export function apply(ctx: any, config: any): void {
         const current = ctx.agents && typeof ctx.agents.get === 'function' ? ctx.agents.get(agent.id) : undefined
         if (!current) return
         const note = makeMessage(
-          render(c.restartInstruction, {
+          render(instructionOverride ?? c.restartInstruction, {
             provider: current.options?.provider ?? '', model: current.options?.model ?? '',
             code: failure.code ?? '', status: failure.status ?? '', message: failure.message ?? '',
             count, sessionId: String(agent.id),
           }),
-          `relay-watchdog: 连接恢复后自动重新唤醒（第 ${count} 次）`,
+          isCutoff
+            ? `relay-watchdog: 输出截断后自动续跑（第 ${count}/${c.maxAutoRestartsPerSession} 次）`
+            : `relay-watchdog: 连接恢复后自动重新唤醒（第 ${count}/${c.maxAutoRestartsPerSession} 次）`,
         )
         current.followup(note)
         pushIncident({
@@ -284,7 +333,7 @@ export function apply(ctx: any, config: any): void {
           provider: current.options?.provider ?? '', code: failure.code ?? '',
           status: failure.status ?? '', message: failure.message ?? '', attempt: count,
         })
-        log.info?.(`[${agent.id}] 自动重新唤醒对话（第 ${count}/${c.maxAutoRestartsPerSession} 次）`)
+        log.info?.(`[${agent.id}] 自动${isCutoff ? '续跑' : '重新唤醒'}对话（第 ${count}/${c.maxAutoRestartsPerSession} 次，${failure.code ?? 'UNKNOWN'}）`)
       } catch (err) {
         log.warn?.('自动续跑 followup 失败:', err && ((err as any).stack || String(err)))
       }
@@ -298,32 +347,57 @@ export function apply(ctx: any, config: any): void {
       const c = cfg()
       if (event.type !== 'turn/end') return
       const reason = event.data && event.data.reason
-      if (!reason || reason.kind !== 'error') return
+      if (!reason) return
 
-      const conn = isConnectionFailure(reason.error)
+      // 任何回合结束时清理该会话的 attempts，避免 (session,turn,step) 计数无限累积
+      clearAttemptsFor(String(session.id))
+
+      const isError = reason.kind === 'error'
+      const isCutoff = reason.kind === 'max-tokens'
+      const isCompleted = reason.kind === 'completed'
+
+      // 成功回合 = 中转站已恢复的信号：清零该会话的复活预算，之后可再次获得完整预算
+      if (isCompleted && c.resetBudgetOnSuccess) {
+        const st = restarts.get(String(session.id))
+        if (st && st.count > 0) {
+          restarts.set(String(session.id), { count: 0, lastAt: st.lastAt })
+          log.info?.(`[${session.id}] 回合成功完成，自动唤醒预算已重置`)
+        }
+      }
+
+      if (!isError && !isCutoff) return
+
+      // 截断（max-tokens）不是 request-error，拿不到 failure：为两种场景统一构造失败事实
+      const failure: any = isError
+        ? (reason.error ?? { message: 'unknown turn error', code: 'UNKNOWN' })
+        : { message: '输出达到 token 上限，回合被截断', code: 'MAX_TOKENS', status: undefined }
+
+      const conn = isError ? isConnectionFailure(reason.error) : false
+      const cutoffRevive = isCutoff && c.reviveOnMaxTokens
       const agent = ctx.agents && typeof ctx.agents.get === 'function' ? ctx.agents.get(session.id) : undefined
-      const willAct = c.enabled && !c.manualOverride && c.restartOnTurnError && conn && agent && wanted(agent)
+      const willAct = c.enabled && !c.manualOverride && c.restartOnTurnError && (conn || cutoffRevive) && agent && wanted(agent)
 
+      // 日常收集：回合级错误/截断也入账（与步内收集互补），避免漏判
       if (c.collectAllErrors && !willAct) {
         pushIncident({
-          id: randomUUID(), time: Date.now(), kind: 'error',
+          id: randomUUID(), time: Date.now(), kind: isCutoff ? 'cutoff' : 'error',
           sessionId: String(session.id), turn: null, step: null,
           provider: agent?.options?.provider ?? '',
-          code: reason.error?.code ?? '', status: reason.error?.status ?? '', message: reason.error?.message ?? '',
-          attempt: null, note: 'turn-error: collectAllErrors 已收集',
+          code: failure.code ?? '', status: failure.status ?? '', message: failure.message ?? '',
+          attempt: null, note: isCutoff ? 'max-tokens: collectAllErrors 已收集' : 'turn-error: collectAllErrors 已收集',
         })
-        log.info?.(`[${session.id}] 回合错误已收集 (${reason.error?.code ?? 'UNKNOWN'})`)
+        log.info?.(`[${session.id}] 回合${isCutoff ? '截断' : '错误'}已收集 (${failure.code ?? 'UNKNOWN'})`)
       }
 
       if (!willAct) return
 
       const now = Date.now()
-      const state = restarts.get(session.id) || { count: 0, lastAt: 0 }
+      const state = restarts.get(String(session.id)) || { count: 0, lastAt: 0 }
       if (now - state.lastAt < c.restartCooldownMs) return
       if (state.count >= c.maxAutoRestartsPerSession) return
       const nextState = { count: state.count + 1, lastAt: now }
-      restarts.set(session.id, nextState)
-      scheduleRestart(agent, reason.error, nextState.count)
+      restarts.set(String(session.id), nextState)
+      scheduleRestart(agent, failure, nextState.count, isCutoff ? c.cutoffInstruction : undefined, isCutoff)
     } catch (err) {
       log.warn?.('turn-error 自动续跑处理异常:', err && ((err as any).stack || String(err)))
     }
@@ -338,9 +412,9 @@ export function apply(ctx: any, config: any): void {
       retryableCodes: [...(c.retryableCodes || [])],
       retryableStatuses: [...(c.retryableStatuses || [])],
       retryableMessagePatterns: [...(c.retryableMessagePatterns || [])],
-      maxRetries: c.maxRetries, fastRetryCount: c.fastRetryCount, fastRetryDelayMs: c.fastRetryDelayMs, steadyRetryDelayMs: c.steadyRetryDelayMs, rateLimitBaseDelayMs: c.rateLimitBaseDelayMs, maxDelayMs: c.maxDelayMs,
+      maxRetries: c.maxRetries, stopAfterExhaustion: !!c.stopAfterExhaustion, fastRetryCount: c.fastRetryCount, fastRetryDelayMs: c.fastRetryDelayMs, steadyRetryDelayMs: c.steadyRetryDelayMs, rateLimitBaseDelayMs: c.rateLimitBaseDelayMs, maxDelayMs: c.maxDelayMs,
       appendInstruction: !!c.appendInstruction, instructionCooldownMs: c.instructionCooldownMs,
-      restartOnTurnError: !!c.restartOnTurnError, restartCooldownMs: c.restartCooldownMs, maxAutoRestartsPerSession: c.maxAutoRestartsPerSession,
+      restartOnTurnError: !!c.restartOnTurnError, reviveOnMaxTokens: !!c.reviveOnMaxTokens, restartCooldownMs: c.restartCooldownMs, maxAutoRestartsPerSession: c.maxAutoRestartsPerSession, resetBudgetOnSuccess: !!c.resetBudgetOnSuccess,
       activeRestarts: Object.fromEntries([...restarts.entries()]),
       incidents: incidents.slice(-30).reverse(),
     }
@@ -351,7 +425,8 @@ export function apply(ctx: any, config: any): void {
     if (webServer && typeof webServer.register === 'function') {
       const json = (res: any, code: number, obj: any) => {
         res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.setHeader('Access-Control-Allow-Origin', '*')
+        // 本地诊断接口不放行任意跨域源（避免任意网页经 CORS 读本机会话信息），并禁止缓存
+        res.setHeader('Cache-Control', 'no-store')
         res.statusCode = code
         res.end(JSON.stringify(obj))
       }
@@ -406,6 +481,8 @@ export function apply(ctx: any, config: any): void {
   log.info?.('dsh-relay-watchdog 已启动', {
     enabled: cfg().enabled, manualOverride: cfg().manualOverride, collectAllErrors: cfg().collectAllErrors,
     watchAll: cfg().watchAll, sessionIdPattern: cfg().sessionIdPattern,
-    maxRetries: cfg().maxRetries, restartOnTurnError: cfg().restartOnTurnError,
+    maxRetries: cfg().maxRetries, stopAfterExhaustion: cfg().stopAfterExhaustion,
+    restartOnTurnError: cfg().restartOnTurnError, reviveOnMaxTokens: cfg().reviveOnMaxTokens, resetBudgetOnSuccess: cfg().resetBudgetOnSuccess,
+    retryableMessagePatterns: cfg().retryableMessagePatterns,
   })
 }

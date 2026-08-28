@@ -10,16 +10,20 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 - **两层兜底**
   1. step 内自动重试：连接类失败出现时退避后原步重试，重试前把一条可配置的「从断点继续」指令注入会话。
   2. 回合级复活：重试耗尽、回合以 error 结束时，冷却后 `agent.followup()` 重新唤醒对话（次数可限）。
+- **输出截断续跑**：回合因达到 token 上限（`max-tokens`）被截断时，也会冷却后自动重新唤醒并从截断处继续，避免“任务做到一半静默停住”。
 - **快→稳退避**：断联类错误先快速连试几次，仍失败则转固定稳态间隔，兼顾“瞬时错误快恢复”和“持续故障不猛打”。
-- **限流保守**：`RATE_LIMIT`(429) 不打快速连试，按固定间隔排队，并优先尊重服务端 `Retry-After`。
+- **限流保守**：`RATE_LIMIT`(429) 不打快速连试，按固定间隔排队（带 ±10% 抖动），并优先尊重服务端 `Retry-After`。
+- **耗尽即终态（防无限乒乓）**：`stopAfterExhaustion=true` 时，单步重试耗尽后终止本回合（不把失败放行给下游重试插件），由回合级复活接管——与随附的 `dsh-llm-retry` 并存时也不会互相接力导致同一 step 无限重试。
+- **消息关键词兜底**：`retryableMessagePatterns` 默认包含 `upstream` / `temporarily unavailable` / `rate limit exceeded`，可匹配上游不带状态码的裸错误消息（例如 pi-ai 适配器把 502 文本归为 `PI_AI_ERROR`）。
+- **预算自适应**：`resetBudgetOnSuccess=true` 时，会话出现一次成功回合即清零自动唤醒次数，中转站恢复后预算重新计满。
 - **人工接管开关**：`manualOverride=true` 时只检测/记录，不做任何自动动作，方便手动介入。
 - **错误收集**：`collectAllErrors=true` 时，所有 API 模型调用错误（不论是否连接类）都记入 `incidents`，避免漏判。
 - **独立设置页**：接入 DSH 设置面板，注册独立 `settings.section`，全部参数可视化调整、即时生效。
-- **状态接口**：`GET /dsh-relay-watchdog/status` 返回配置摘要与最近事件记录。
+- **状态接口**：`GET /dsh-relay-watchdog/status` 返回配置摘要与最近事件记录（本机诊断接口，不放行跨域）。
 
 ## 默认行为逻辑
 
-> 默认：`maxRetries=8, fastRetryCount=3, fastRetryDelayMs=800, steadyRetryDelayMs=30000, rateLimitBaseDelayMs=15000, maxDelayMs=30000, jitterRatio=0.1, restartCooldownMs=15000, maxAutoRestartsPerSession=5`
+> 默认：`maxRetries=8, stopAfterExhaustion=true, fastRetryCount=3, fastRetryDelayMs=800, steadyRetryDelayMs=30000, rateLimitBaseDelayMs=15000, maxDelayMs=30000, jitterRatio=0.1, restartCooldownMs=15000, maxAutoRestartsPerSession=5, reviveOnMaxTokens=true, resetBudgetOnSuccess=true`
 
 ### 断联类错误（TRANSPORT / SERVER / TIMEOUT / HTTP_502/503/504 / UNKNOWN）
 
@@ -41,13 +45,16 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 
 ### 429 限流（RATE_LIMIT）
 
-- 不打快速连试，每次固定 15s：15s、30s、45s、60s、75s、90s、105s、120s。
-- 约 2 分钟后放弃本步；若服务端返回 `Retry-After`，则一次等待 = `min(Retry-After, 30s)`。
+- 不打快速连试，每次按 `15s × (1 ± 10%)` 抖动排队：约 13.5s、27s、40.5s、54s、67.5s、81s、94.5s、108s。
+- 约 2 分钟后放弃本步（`stopAfterExhaustion=true` 时以终态结束回合）；若服务端返回 `Retry-After`，则一次等待 = `min(Retry-After, 30s)`。
 
 ### 回合级复活
 
-- step 重试耗尽、回合以 error 结束后，等待 15s 再 `followup` 重新唤醒。
+- step 重试耗尽（或回合以连接类 error 结束）后，等待 15s 再 `followup` 重新唤醒。
 - 每会话最多自动复活 5 次；最坏全程约 16.5 分钟，之后停止自动动作（期间每个错误均已记录）。
+- **输出截断（max-tokens）**：`reviveOnMaxTokens=true` 时，回合因达到 token 上限被截断也按同一冷却/预算规则自动续跑，注入独立的「截断续跑指令」。
+- **预算自适应**：`resetBudgetOnSuccess=true` 时，会话出现一次成功回合即清零自动唤醒次数，避免中转站恢复后预算永久耗尽。
+- **耗尽即终态**：`stopAfterExhaustion=true`（默认）时，单步重试耗尽不再把失败放行给下游重试插件（如随附的 `dsh-llm-retry`），避免同一 step 被两个重试层接力、回合永不结束；改为以 error 终态结束回合，由本层复活接管。若你希望保留下游重试接管，可将其设为 `false`。
 
 ## 安装
 
@@ -99,9 +106,10 @@ bash scripts/build.sh
 | `watchAll` | `true` | 监测所有对话 |
 | `sessionIdPattern` | `""` | 只监测会话 id 包含该子串的对话（配合 `watchAll:false`） |
 | `retryableCodes` | `TRANSPORT, SERVER, TIMEOUT, RATE_LIMIT, HTTP_502, HTTP_503, HTTP_504, UNKNOWN` | 连接类失败错误码 |
-| `retryableStatuses` | `[502, 503, 504]` | 连接类失败 HTTP 状态码 |
-| `retryableMessagePatterns` | `[]` | 按错误消息关键词兜底匹配 |
+| `retryableStatuses` | `[500, 502, 503, 504]` | 连接类失败 HTTP 状态码（含上游 500 gateway error） |
+| `retryableMessagePatterns` | `upstream, temporarily unavailable, rate limit exceeded` | 按错误消息关键词兜底匹配（`upstream` 覆盖各类上游错误文本） |
 | `maxRetries` | `8` | 单 step 内最大重试次数 |
+| `stopAfterExhaustion` | `true` | 单步重试耗尽后终止本回合（不交给下游重试插件），由回合级复活接管 |
 | `fastRetryCount` | `3` | 快速重试次数 |
 | `fastRetryDelayMs` | `800` | 快速重试间隔（ms） |
 | `steadyRetryDelayMs` | `30000` | 稳态重试间隔（ms） |
@@ -112,9 +120,12 @@ bash scripts/build.sh
 | `instruction` | 见源码 | 续跑指令模板（支持 `{provider}`/`{code}`/`{status}`/`{message}`/`{turn}`/`{step}`/`{attempt}`/`{sessionId}`/`{model}`） |
 | `instructionCooldownMs` | `60000` | 同会话注入指令的最小间隔 |
 | `restartOnTurnError` | `true` | 回合错误后是否自动重新唤醒 |
+| `reviveOnMaxTokens` | `true` | 回合因 token 上限截断时是否自动续跑 |
 | `restartInstruction` | 见源码 | 重新唤醒指令模板 |
+| `cutoffInstruction` | 见源码 | 截断续跑指令模板（支持 `{provider}`/`{model}`/`{code}`/`{status}`/`{message}`/`{count}`/`{sessionId}`） |
 | `restartCooldownMs` | `15000` | 复活冷却（ms） |
 | `maxAutoRestartsPerSession` | `5` | 每会话最大自动复活次数 |
+| `resetBudgetOnSuccess` | `true` | 成功回合后清零该会话复活预算，重新计满 |
 | `enableApi` | `true` | 是否注册状态路由（启动时） |
 | `maxIncidents` | `200` | 内存中保留的事件条数 |
 
