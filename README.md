@@ -14,7 +14,7 @@ DSH 插件：监测「模型 / 中转站 API」调用失败，自动重试并在
 - **快→稳退避**：断联类错误先快速连试几次，仍失败则转固定稳态间隔，兼顾“瞬时错误快恢复”和“持续故障不猛打”。
 - **限流保守**：`RATE_LIMIT`(429) 不打快速连试，按固定间隔排队（带 ±10% 抖动），并优先尊重服务端 `Retry-After`。
 - **耗尽即终态（防无限乒乓）**：`stopAfterExhaustion=true` 时，单步重试耗尽后终止本回合（不把失败放行给下游重试插件），由回合级复活接管——与随附的 `dsh-llm-retry` 并存时也不会互相接力导致同一 step 无限重试。
-- **消息关键词兜底**：`retryableMessagePatterns` 默认包含 `upstream` / `temporarily unavailable` / `rate limit exceeded`，可匹配上游不带状态码的裸错误消息（例如 pi-ai 适配器把 502 文本归为 `PI_AI_ERROR`）。
+- **消息关键词兜底**：`retryableMessagePatterns` 默认包含 `upstream` / `524` / `temporarily unavailable` / `rate limit exceeded`，可匹配上游不带状态码的裸错误消息（例如 pi-ai 适配器把 502 文本归为 `PI_AI_ERROR`，或 Cloudflare 网关超时 `524 status code (no body)`）。
 - **预算自适应**：`resetBudgetOnSuccess=true` 时，会话出现一次成功回合即清零自动唤醒次数，中转站恢复后预算重新计满。
 - **人工接管开关**：`manualOverride=true` 时只检测/记录，不做任何自动动作，方便手动介入。
 - **错误收集**：`collectAllErrors=true` 时，所有 API 模型调用错误（不论是否连接类）都记入 `incidents`，避免漏判。
@@ -106,8 +106,8 @@ bash scripts/build.sh
 | `watchAll` | `true` | 监测所有对话 |
 | `sessionIdPattern` | `""` | 只监测会话 id 包含该子串的对话（配合 `watchAll:false`） |
 | `retryableCodes` | `TRANSPORT, SERVER, TIMEOUT, RATE_LIMIT, HTTP_502, HTTP_503, HTTP_504, UNKNOWN` | 连接类失败错误码 |
-| `retryableStatuses` | `[500, 502, 503, 504]` | 连接类失败 HTTP 状态码（含上游 500 gateway error） |
-| `retryableMessagePatterns` | `upstream, temporarily unavailable, rate limit exceeded` | 按错误消息关键词兜底匹配（`upstream` 覆盖各类上游错误文本） |
+| `retryableStatuses` | `[500, 502, 503, 504, 524]` | 连接类失败 HTTP 状态码（含上游 500 gateway error、Cloudflare 524 网关超时） |
+| `retryableMessagePatterns` | `upstream, 524, temporarily unavailable, rate limit exceeded` | 按错误消息关键词兜底匹配（`upstream` 覆盖各类上游错误文本、`524` 覆盖无响应体网关超时） |
 | `maxRetries` | `8` | 单 step 内最大重试次数 |
 | `stopAfterExhaustion` | `true` | 单步重试耗尽后终止本回合（不交给下游重试插件），由回合级复活接管 |
 | `fastRetryCount` | `3` | 快速重试次数 |
